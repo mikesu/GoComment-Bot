@@ -9,11 +9,11 @@ import (
     "io"
 	"log"
 	"strconv"
-	"fmt"
+	"strings"
 )
 
 func newGoComment() (*GoComment,error){
-	bytes, err := ioutil.ReadFile("C:/dev/workspaces/go/src/mikesu.net/gocomment/gocomment.conf")
+	bytes, err := ioutil.ReadFile("./gocomment-oauth.conf")
 	if err != nil {
 		log.Fatal(err)
 		return nil, err
@@ -27,17 +27,18 @@ func newGoComment() (*GoComment,error){
     return &goComment, nil
 }
 
-func token(w http.ResponseWriter, req *http.Request) {
-	io.WriteString(w, "token=abc")
-}
-
 type GoComment struct{
 	Client_id, Client_secret string
 	Port int
 }
 
-func (goComment *GoComment)  Redirect(w http.ResponseWriter, req *http.Request) {
+func (goComment *GoComment)  IndexHandler(w http.ResponseWriter, req *http.Request) {
 	encoded_url := req.FormValue("url")
+	if encoded_url == "" {
+		log.Println("url is null")
+		io.WriteString(w, "url is null")
+		return
+	}
 	decoded_url, err := base64.StdEncoding.DecodeString(encoded_url)
 	if err != nil {
 		log.Fatal(err)
@@ -45,25 +46,36 @@ func (goComment *GoComment)  Redirect(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	code := req.FormValue("code")
+	if code == "" {
+		log.Println("code is null")
+		io.WriteString(w, "code is null")
+		return
+	}
+	log.Println("code:" + code)
 	data := url.Values{}
 	data.Set("code", code)
 	data.Set("client_id", goComment.Client_id)
 	data.Set("client_secret", goComment.Client_secret)
-	//resp, err := http.Post("https://github.com/login/oauth/access_token",data)
-	resp, err := http.PostForm("http://localhost:"+strconv.Itoa(goComment.Port) +"/token", data)
+	resp, err := http.PostForm("https://github.com/login/oauth/access_token",data)
 	if err != nil {
 		log.Fatal(err)
 		io.WriteString(w, err.Error())
 		return
 	}
-	token, err := ioutil.ReadAll(resp.Body)
+	tokenByte, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Fatal(err)
 		io.WriteString(w, err.Error())
 		return
 	}
-	redirect_url := string(decoded_url) + "?" + string(token)
-	fmt.Println(strconv.Itoa(goComment.Port))
+	token := string(tokenByte)
+	if strings.HasPrefix(token, "error") {
+		log.Fatal("oauth error: " + token)
+		io.WriteString(w, "oauth error: " + token)
+		return
+	}
+	log.Println("token:" + token)
+	redirect_url := string(decoded_url) + "?" + token
 	http.Redirect(w,req,redirect_url,302)
 }
  
@@ -73,8 +85,6 @@ func main() {
 		log.Fatal(err)
 		return
 	}
-	http.HandleFunc("/token", token)
-    http.HandleFunc("/redirect", goComment.Redirect)
-    fmt.Println(strconv.Itoa(goComment.Port))
+    http.HandleFunc("/", goComment.IndexHandler)
     http.ListenAndServe(":"+strconv.Itoa(goComment.Port), nil)
 }
