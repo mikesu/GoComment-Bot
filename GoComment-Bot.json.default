@@ -1,0 +1,7 @@
+{
+	"client_id":"client_id",
+	"client_secret":"client_secret",
+	"pem_path":"pem_path",
+	"app_id":"app_id",
+	"port":3000
+}
