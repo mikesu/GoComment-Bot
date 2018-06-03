@@ -2,5 +2,5 @@
 
 # Editor directories and files
 *.idea
-*.json
+GoComment-Bot.json
 *.pem

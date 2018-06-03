@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -47,7 +50,7 @@ func newGoComment() (*GoComment, error) {
 	claims := new(jwt.StandardClaims)
 	now := time.Now()
 	claims.IssuedAt = now.Unix()
-	claims.ExpiresAt = now.Add(time.Minute * time.Duration(10)).Unix()
+	claims.ExpiresAt = now.Add(time.Minute * time.Duration(8)).Unix()
 	claims.Issuer = gc.AppId
 	gc.jwtToken = jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	gc.bearer, err = gc.jwtToken.SignedString(gc.privateKey)
@@ -56,7 +59,11 @@ func newGoComment() (*GoComment, error) {
 		return nil, err
 	}
 	//初始化缓存
-	gc.tokenCache = cache.New(55*time.Minute, 10*time.Minute)
+	gc.botTokenCache = cache.New(55*time.Minute, 10*time.Minute)
+	gc.validCache = cache.New(time.Hour, 10*time.Minute)
+	gc.oauthCache = cache.New(time.Hour, 10*time.Minute)
+	gc.issueCache = cache.New(time.Hour, 10*time.Minute)
+	log.Println("Go Comment Bot running")
 	return gc, nil
 }
 
@@ -64,6 +71,7 @@ type BotToken struct {
 	Token   string `json:"token,omitempty"`
 	Expires string `json:"expries_at,omitempty"`
 	Error   string `json:"error,omitempty"`
+	Valid   bool
 }
 
 type UserToken struct {
@@ -71,6 +79,7 @@ type UserToken struct {
 	Type  string `json:"token_type,omitempty"`
 	Scope string `json:"scope,omitempty"`
 	Error string `json:"error,omitempty"`
+	Valid bool
 }
 
 type Issue struct {
@@ -80,6 +89,8 @@ type Issue struct {
 	UserToken      string `json:"access_token,omitempty"`
 	Title          string `json:"title,omitempty"`
 	Body           string `json:"body,omitempty"`
+	Pid            string `json:"pid,omitempty"`
+	IssueUrl       string `json:"html_url,omitempty"`
 	CommentsUrl    string `json:"comments_url,omitempty"`
 }
 
@@ -90,52 +101,65 @@ type AuthData struct {
 }
 
 type GoComment struct {
-	ClientId     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	AppId        string `json:"app_id"`
-	PemPath      string `json:"pem_path"`
-	Port         int    `json:"port"`
-	privateKey   *rsa.PrivateKey
-	tokenCache   *cache.Cache
-	jwtToken     *jwt.Token
-	bearer       string
+	ClientId      string `json:"client_id"`
+	ClientSecret  string `json:"client_secret"`
+	AppId         string `json:"app_id"`
+	PemPath       string `json:"pem_path"`
+	Port          int    `json:"port"`
+	privateKey    *rsa.PrivateKey
+	botTokenCache *cache.Cache
+	validCache    *cache.Cache
+	oauthCache    *cache.Cache
+	issueCache    *cache.Cache
+	jwtToken      *jwt.Token
+	bearer        string
 }
 
 func (gc *GoComment) checkUserToken(userToken string) bool {
 	if userToken == "" {
 		return false
 	}
-	apiUrl := "https://api.github.com/applications/" + gc.ClientId + "/tokens/" + userToken
-	request, err := http.NewRequest("GET", apiUrl, nil)
-	request.SetBasicAuth(gc.ClientId, gc.ClientSecret)
-	client := &http.Client{}
-	response, err := client.Do(request)
-	if err != nil {
-		log.Println(err)
-		return false
-	}
-	if response.StatusCode == 200 {
-		return true
+	result := false
+	cacheResult, found := gc.validCache.Get(userToken)
+	if !found {
+		apiUrl := "https://api.github.com/applications/" + gc.ClientId + "/tokens/" + userToken
+		request, err := http.NewRequest("GET", apiUrl, nil)
+		request.SetBasicAuth(gc.ClientId, gc.ClientSecret)
+		client := &http.Client{}
+		response, err := client.Do(request)
+		if err != nil {
+			log.Println(err)
+			return false
+		}
+		if response.StatusCode == 200 {
+			result = true
+		} else {
+			log.Println("CheckUserToken: " + response.Status)
+			resultBytes, _ := ioutil.ReadAll(response.Body)
+			log.Println(string(resultBytes))
+			result = false
+		}
+		gc.validCache.Set(userToken, result, cache.DefaultExpiration)
 	} else {
-		return false
+		result = cacheResult.(bool)
 	}
+	return result
 }
 
-func (gc *GoComment) getBotToken(installationId string) (string, error) {
-	var token string
-	cacheToken, found := gc.tokenCache.Get(installationId)
+func (gc *GoComment) getBotToken(installationId string) (*BotToken, error) {
+	var botToken *BotToken
+	botTokenCache, found := gc.botTokenCache.Get(installationId)
 	if !found {
 		if gc.jwtToken.Claims.Valid() == nil {
 			claims := new(jwt.StandardClaims)
 			now := time.Now()
 			claims.IssuedAt = now.Unix()
-			claims.ExpiresAt = now.Add(time.Minute * time.Duration(10)).Unix()
+			claims.ExpiresAt = now.Add(time.Minute * time.Duration(8)).Unix()
 			claims.Issuer = gc.AppId
 			gc.jwtToken.Claims = claims
 			bearer, err := gc.jwtToken.SignedString(gc.privateKey)
 			if err != nil {
-				log.Println(err)
-				return "", err
+				return nil, err
 			}
 			gc.bearer = bearer
 		}
@@ -143,24 +167,30 @@ func (gc *GoComment) getBotToken(installationId string) (string, error) {
 		headers := make(map[string]string)
 		headers["Authorization"] = "Bearer " + gc.bearer
 		headers["Accept"] = "application/vnd.github.machine-man-preview+json"
-		botToken := new(BotToken)
+		botToken = new(BotToken)
 		err := httpPost(apiUrl, headers, nil, botToken)
 		if err != nil {
-			log.Println(err)
-			return "", err
+			log.Println("getBotToken error: " + err.Error())
+			botToken.Error = err.Error()
+			gc.botTokenCache.Set(installationId, botToken, time.Minute)
+			return nil, err
 		}
-		gc.tokenCache.Set(installationId, botToken.Token, cache.DefaultExpiration)
-		token = botToken.Token
+		botToken.Valid = true
+		gc.botTokenCache.Set(installationId, botToken, cache.DefaultExpiration)
 	} else {
-		token = cacheToken.(string)
+		botToken = botTokenCache.(*BotToken)
 	}
-	return token, nil
+	if !botToken.Valid {
+		return nil, errors.New(botToken.Error)
+	}
+	return botToken, nil
 }
 
 func (gc *GoComment) Issue(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")             //允许访问所有域
 	w.Header().Add("Access-Control-Allow-Headers", "Content-Type") //header的类型
 	w.Header().Set("content-type", "application/json")             //返回数据格式是json
+	//读取请求内容
 	bodyByte, err := ioutil.ReadAll(io.LimitReader(req.Body, 1048576))
 	log.Println("Issue: " + string(bodyByte))
 	if err != nil {
@@ -168,6 +198,8 @@ func (gc *GoComment) Issue(w http.ResponseWriter, req *http.Request) {
 		json.NewEncoder(w).Encode(err)
 		return
 	}
+
+	//转换为issue
 	issue := new(Issue)
 	err = json.Unmarshal(bodyByte, issue)
 	if err != nil {
@@ -175,24 +207,45 @@ func (gc *GoComment) Issue(w http.ResponseWriter, req *http.Request) {
 		json.NewEncoder(w).Encode(err)
 		return
 	}
+
+	//计算 issue key
+	keyBytes := []byte(issue.Owner + "/" + issue.Repo + "/" + issue.Pid)
+	key := fmt.Sprintf("%x", md5.Sum(keyBytes))
+
+	//防止重复提交
+	_, found := gc.issueCache.Get(key)
+	if found {
+		log.Println(err)
+		json.NewEncoder(w).Encode(errors.New("issue duplicate"))
+		return
+	} else {
+		gc.issueCache.Set(key, key, cache.DefaultExpiration)
+	}
+
+	//检查 user token
 	if !gc.checkUserToken(issue.UserToken) {
 		log.Println("Invalid token")
 		json.NewEncoder(w).Encode("Invalid token")
 		return
 	}
-	token, err := gc.getBotToken(issue.InstallationId)
+	//获取 bot token
+	botToken, err := gc.getBotToken(issue.InstallationId)
 	if err != nil {
 		log.Println(err)
 		json.NewEncoder(w).Encode(err)
 		return
 	}
+
+	//新建issue
+	issue.Body = issue.Body + "\n---\n`" + key + "`"
 	apiUrl := "https://api.github.com/repos/" + issue.Owner + "/" + issue.Repo + "/issues"
 	headers := make(map[string]string)
-	headers["Authorization"] = "token " + token
+	headers["Authorization"] = "token " + botToken.Token
 	headers["Accept"] = "application/vnd.github.machine-man-preview+json"
 	result := new(Issue)
 	err = httpPost(apiUrl, headers, issue, result)
 	if err != nil {
+		gc.issueCache.Delete(key)
 		log.Println(err)
 		json.NewEncoder(w).Encode(err)
 		return
@@ -201,6 +254,7 @@ func (gc *GoComment) Issue(w http.ResponseWriter, req *http.Request) {
 }
 
 func (gc *GoComment) OAuth(w http.ResponseWriter, req *http.Request) {
+	//检查重定向url
 	encodeUrl := req.FormValue("url")
 	if encodeUrl == "" {
 		log.Println("url is null")
@@ -213,6 +267,13 @@ func (gc *GoComment) OAuth(w http.ResponseWriter, req *http.Request) {
 		io.WriteString(w, err.Error())
 		return
 	}
+	redirectUrl, err := url.Parse(string(decodedUrl))
+	if err != nil {
+		log.Println(err)
+		io.WriteString(w, err.Error())
+		return
+	}
+	//检查code
 	code := req.FormValue("code")
 	if code == "" {
 		log.Println("code is null")
@@ -220,32 +281,40 @@ func (gc *GoComment) OAuth(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	log.Println("code:" + code)
-	oauthUrl := "https://github.com/login/oauth/access_token"
-	data := new(AuthData)
-	data.Code = code
-	data.ClientId = gc.ClientId
-	data.ClientSecret = gc.ClientSecret
-	headers := make(map[string]string)
-	headers["Accept"] = "application/json"
-	userToken := new(UserToken)
-	err = httpPost(oauthUrl, headers, data, userToken)
-	if err != nil {
-		log.Println(err)
-		io.WriteString(w, err.Error())
-		return
+	var userToken *UserToken
+
+	//读取 user token 缓存
+	userTokenCache, found := gc.oauthCache.Get(code)
+	if !found {
+		oauthUrl := "https://github.com/login/oauth/access_token"
+		data := new(AuthData)
+		data.Code = code
+		data.ClientId = gc.ClientId
+		data.ClientSecret = gc.ClientSecret
+		headers := make(map[string]string)
+		headers["Accept"] = "application/json"
+		userToken = new(UserToken)
+		err = httpPost(oauthUrl, headers, data, userToken)
+		if err != nil {
+			userToken.Error = err.Error()
+		}
+		if userToken.Error != "" {
+			gc.oauthCache.Set(code, userToken, cache.DefaultExpiration)
+			log.Println("oauth error: " + userToken.Error)
+			io.WriteString(w, "oauth error: "+userToken.Error)
+			return
+		}
+		userToken.Valid = true
+		gc.oauthCache.Set(code, userToken, cache.DefaultExpiration)
+	} else {
+		userToken = userTokenCache.(*UserToken)
 	}
-	if userToken.Error != "" {
+	if !userToken.Valid {
 		log.Println("oauth error: " + userToken.Error)
 		io.WriteString(w, "oauth error: "+userToken.Error)
 		return
 	}
 	log.Println("token:" + userToken.Token)
-	redirectUrl, err := url.Parse(string(decodedUrl))
-	if err != nil {
-		log.Println(err)
-		io.WriteString(w, err.Error())
-		return
-	}
 	query := redirectUrl.Query()
 	query.Add("access_token", userToken.Token)
 	redirectUrl.RawQuery = query.Encode()
@@ -278,13 +347,15 @@ func httpPost(url string, headers map[string]string, data interface{}, result in
 		return err
 	}
 	defer response.Body.Close()
-	log.Println("httpPost: StatusCode:" + response.Status)
 	resultBytes, err := ioutil.ReadAll(response.Body)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	log.Println(string(resultBytes))
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return errors.New(string(resultBytes))
+	}
+	log.Println("httpPost result:" + string(resultBytes))
 	return json.Unmarshal(resultBytes, result)
 }
 
